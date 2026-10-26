@@ -1,0 +1,8 @@
+*.iwd
+*.ff
+*.log
+demo/
+recipes/
+*.bak*
+console.log
+games_mp.log
