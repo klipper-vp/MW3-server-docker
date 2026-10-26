@@ -29,6 +29,12 @@ init()
     create_dvar("mv_gametypenames", "Team Deathmatch@Free For All@Domination@Kill Confirmed@Sabotage@Gungame@Search & Destroy@Infected");
     create_dvar("mv_randomgametypeenable", 1);
 
+    // Modos proibidos por mapa: "mapa:modo,modo@mapa:modo".
+    // Mapa portado sem os spawns/bombzone do modo derruba a partida em segundos e o
+    // motor relanca o mesmo nivel, sem trocar de mapa. O sorteio abaixo evita esses
+    // pares: o placar nunca promete um modo que o mapa sorteado nao consegue rodar.
+    create_dvar("mv_mapbans", "mp_terminal_cls:sd");
+
     create_dvar("map1", "none");
     create_dvar("map2", "none");
     create_dvar("map3", "none");
@@ -161,24 +167,84 @@ managegametypenames()
         return [];
 
     gametypesnames = strTok(getDvar("mv_gametypenames"), "@");
+    gametypefiles = strTok(getDvar("mv_gametypefiles"), "@");
+
+    // Modos que algum dos mapas desta votacao nao suporta
+    bloqueados = getmodesbloqueados();
+
+    permitidos = [];
+    for( i = 0; i < gametypefiles.size; i++ )
+    {
+        if( !isnomearray( bloqueados, gametypefiles[i] ) )
+            permitidos[ permitidos.size ] = i;
+    }
+
+    // Banimento largo demais: volta para a lista inteira em vez de nao sortear nada
+    if( permitidos.size == 0 )
+    {
+        for( i = 0; i < gametypefiles.size; i++ )
+            permitidos[ i ] = i;
+    }
 
     gametypes = [];
     gametypes[0] = "unknown";
 
-    gametypes[1] = randomIntRange(0, gametypesnames.size-1);
-    setAllClientsDvar("mapgametype1", gametypesnames[ gametypes[1] ] );
-    gametypes[2] = randomIntRange(0, gametypesnames.size-1);
-    setAllClientsDvar("mapgametype2", gametypesnames[ gametypes[2] ] );
-    gametypes[3] = randomIntRange(0, gametypesnames.size-1);
-    setAllClientsDvar("mapgametype3", gametypesnames[ gametypes[3] ] );
-    gametypes[4] = randomIntRange(0, gametypesnames.size-1);
-    setAllClientsDvar("mapgametype4", gametypesnames[ gametypes[4] ] );
-    gametypes[5] = randomIntRange(0, gametypesnames.size-1);
-    setAllClientsDvar("mapgametype5", gametypesnames[ gametypes[5] ] );
-    gametypes[6] = randomIntRange(0, gametypesnames.size-1);
-    setAllClientsDvar("mapgametype6", gametypesnames[ gametypes[6] ] );
+    for( i = 1; i <= 6; i++ )
+    {
+        escolha = permitidos[ randomIntRange(0, permitidos.size-1) ];
+        gametypes[i] = escolha;
+        setAllClientsDvar("mapgametype" + i, gametypesnames[ escolha ] );
+    }
 
     return gametypes;
+}
+
+// Reune os modos proibidos de todos os mapas que estao na votacao.
+getmodesbloqueados()
+{
+    bloqueados = [];
+    bans = strTok( getDvar("mv_mapbans"), "@" );
+
+    for( i = 1; i <= 6; i++ )
+    {
+        mapa = mapimgtomapid( getDvar("map" + i) );
+
+        for( b = 0; b < bans.size; b++ )
+        {
+            partes = strTok( bans[b], ":" );
+            if( partes.size < 2 )
+                continue;
+            if( partes[0] != mapa )
+                continue;
+
+            modos = strTok( partes[1], "," );
+            for( m = 0; m < modos.size; m++ )
+            {
+                if( !isnomearray( bloqueados, modos[m] ) )
+                    bloqueados[ bloqueados.size ] = modos[m];
+            }
+        }
+    }
+
+    if( bloqueados.size > 0 )
+    {
+        texto = "";
+        for( i = 0; i < bloqueados.size; i++ )
+            texto = texto + bloqueados[i] + " ";
+        print( "Mapvote: modos fora desta votacao -> " + texto );
+    }
+
+    return bloqueados;
+}
+
+isnomearray( array, valor )
+{
+    for( i = 0; i < array.size; i++ )
+    {
+        if( array[i] == valor )
+            return 1;
+    }
+    return 0;
 }
 
 setAllClientsDvar( dvar, value )
