@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mw3-cfgwatch — vigia de configuração do servidor MW3 (Plutonium IW5)
+
+Compara os arquivos de config vivos com o último snapshot conhecido:
+  * mudou  -> grava no repo git (mascarado), commita local e avisa no Discord
+  * igual  -> não faz nada, em silêncio
+
+O arquivo vivo NUNCA é tocado. O valor de rcon_password / tokens / secrets
+é mascarado antes de entrar no git e antes de aparecer no Discord.
+
+Uso:
+    mw3-cfgwatch                 # roda normal (é o que o cron chama)
+    mw3-cfgwatch --dry           # mostra o que faria, não grava nem envia
+    mw3-cfgwatch --teste-discord # manda uma mensagem de teste
+    mw3-cfgwatch --forcar        # regrava o baseline sem alertar
+"""
+
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------- configuração
+CFG_PADRAO = {
+    "live": Path(os.environ.get("MW3_CFGWATCH_LIVE", "/mnt/data/volumes/wm3/gamefiles")),
+    "repo": Path(os.environ.get("MW3_CFGWATCH_REPO", "/root/wm3-repo")),
+    "webhook": Path(os.environ.get("MW3_CFGWATCH_WEBHOOK", "/etc/mw3-alert/webhook")),
+    "estado": Path(os.environ.get("MW3_CFGWATCH_STATE", "/var/lib/mw3-cfgwatch")),
+}
+CFG = dict(CFG_PADRAO)          # sobrescrito pelos argumentos de linha de comando
+
+# caminhos relativos à raiz do gamefiles; a cópia no repo usa o mesmo relativo
+PADROES = (
+    "main/*.cfg",
+    "storage/iw5/*.cfg",
+    "storage/iw5/admin/*.dsr",
+)
+
+LIMITE_DISCORD = 1900          # o Discord corta em 2000
+LIMITE_LINHAS_DIFF = 40        # por arquivo, na mensagem
+
+# chave = valor mascarado; cobre rcon_password, g_password, tokens, api keys
+MASCARA = re.compile(
+    r'^(?P<pre>\s*(?:set|seta)\s+)(?P<chave>[A-Za-z0-9_]*)'
+    r'(?P<sep>[ \t]+)(?P<val>"[^"]*"|\S+)(?P<pos>.*)$'
+)
+CHAVE_SECRETA = re.compile(r'(?i)(password|passwd|token|secret|apikey|api_key|_key$|rcon)')
+SEM_SEGREDO = {'""', ""}
+
+# Fuso das mensagens; o estado interno e a comparacao nao dependem de horario.
+try:
+    from zoneinfo import ZoneInfo
+
+    FUSO = ZoneInfo("America/Sao_Paulo")
+except Exception:                       # sem tzdata no sistema
+    FUSO = timezone(timedelta(hours=-3))
+
+
+# ------------------------------------------------------------------- utilidade
+def agora():
+    """Horario de Brasilia, como aparece nas mensagens."""
+    return datetime.now(FUSO).strftime("%d/%m %H:%M (BRT)")
+
+
+def ler_texto(caminho):
+    """Lê preservando CRLF/LF e tolerando bytes inválidos."""
+    with open(caminho, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        return fh.read()
+
+
+def escrever(caminho, texto):
+    """Grava preservando as quebras de linha originais."""
+    caminho = Path(caminho)
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    with open(caminho, "w", encoding="utf-8", newline="") as fh:
+        fh.write(texto)
+
+
+def mascarar(conteudo):
+    """Devolve o conteúdo com valores sensíveis trocados por ***."""
+    saida = []
+    for linha in conteudo.splitlines(keepends=True):
+        m = MASCARA.match(linha)
+        if m and CHAVE_SECRETA.search(m.group("chave")) and m.group("val") not in SEM_SEGREDO:
+            nova = linha[:m.start("val")] + '"***"' + m.group("pos")
+            saida.append(nova)
+        else:
+            saida.append(linha)
+    return "".join(saida)
+
+
+def arquivos_vivos():
+    """Lista (relativo, caminho_vivo) dos arquivos que interessam."""
+    achados = []
+    for padrao in PADROES:
+        for caminho in sorted(CFG["live"].glob(padrao)):
+            if caminho.is_file():
+                achados.append((caminho.relative_to(CFG["live"]).as_posix(), caminho))
+    return achados
+
+
+def snap_path(rel):
+    return CFG["estado"] / "snap" / rel
+
+
+def impressao(conteudo):
+    """Fingerprint dos valores secretos.
+
+    Fica só no estado local (fora do git): no repo esse hash permitiria
+    ataque de dicionário contra a senha do rcon.
+    """
+    marcas = {}
+    for linha in conteudo.splitlines():
+        m = MASCARA.match(linha)
+        if m and CHAVE_SECRETA.search(m.group("chave")) and m.group("val") not in SEM_SEGREDO:
+            valor = m.group("val").strip('"')
+            marcas[m.group("chave")] = hashlib.sha256(valor.encode("utf-8")).hexdigest()
+    return marcas
+
+
+def ler_json(caminho, padrao):
+    try:
+        return json.loads(Path(caminho).read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return padrao
+
+
+def gravar_json(caminho, dados):
+    caminho = Path(caminho)
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    caminho.write_text(json.dumps(dados, indent=1, sort_keys=True), encoding="utf-8")
+    os.chmod(caminho, 0o600)
+
+
+def git(*args, cwd=None, timeout=60):
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd or CFG["repo"]),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+
+
+# ------------------------------------------------------------------- discord
+def enviar(texto):
+    url = CFG["webhook"].read_text(encoding="utf-8").strip()
+    if not url.startswith(("https://", "http://")):
+        raise SystemExit("webhook inválido em %s" % CFG["webhook"])
+
+    pedacos, atual = [], ""
+    for linha in texto.splitlines(keepends=True):
+        while len(linha) > LIMITE_DISCORD:            # linha gigante: corta
+            if atual:
+                pedacos.append(atual)
+                atual = ""
+            pedacos.append(linha[:LIMITE_DISCORD])
+            linha = linha[LIMITE_DISCORD:]
+        if len(atual) + len(linha) > LIMITE_DISCORD:
+            pedacos.append(atual)
+            atual = ""
+        atual += linha
+    if atual:
+        pedacos.append(atual)
+
+    for pedaco in pedacos:
+        corpo = json.dumps({"content": pedaco}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=corpo,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "mw3-cfgwatch/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if resp.status not in (200, 204):
+                raise RuntimeError("HTTP %s" % resp.status)
+
+
+# -------------------------------------------------------------------- diff
+def diff_resumido(rel, antes, depois, limite=LIMITE_LINHAS_DIFF):
+    linhas = list(
+        difflib.unified_diff(
+            antes.splitlines(),
+            depois.splitlines(),
+            fromfile="%s (antes)" % rel,
+            tofile="%s (agora)" % rel,
+            lineterm="",
+            n=1,
+        )
+    )
+    if len(linhas) > limite:
+        resto = len(linhas) - limite
+        linhas = linhas[:limite] + ["... (+%d linhas)" % resto]
+    return "\n".join(linhas)
+
+
+def resumo_arquivo(antes, depois):
+    """Conta linhas somadas/removidas, útil quando o diff é enorme."""
+    d = difflib.ndiff(antes.splitlines(), depois.splitlines())
+    add = sum(1 for l in d if l.startswith("+ "))
+    rem = sum(1 for l in d if l.startswith("- "))
+    return add, rem
+
+
+# --------------------------------------------------------------------- git
+def identidade():
+    """Se o repo não tiver user.name/email (cron não herda nada), usa um padrão."""
+    if git("config", "user.email").stdout.strip():
+        return []
+    return ["-c", "user.name=mw3-cfgwatch", "-c", "user.email=mw3-cfgwatch@localhost"]
+
+
+def versionar(mudancas, mensagem):
+    """Copia os arquivos para o repo, adiciona só eles e commita."""
+    rels = []
+    for rel, novo in mudancas:
+        if novo is None:                                 # arquivo removido do servidor
+            git("rm", "-q", "-f", "--ignore-unmatch", "--", rel)
+        else:
+            escrever(CFG["repo"] / rel, novo)
+        rels.append(rel)
+
+    git("add", "--", *rels)
+    commit = git(*identidade(), "commit", "-m", mensagem, "--", *rels)
+    if commit.returncode != 0:
+        saida = (commit.stdout + commit.stderr).strip()
+        if "nothing to commit" in saida or "nada a submeter" in saida:
+            return None, "sem mudança real no git"
+        return None, saida.splitlines()[0] if saida else "git commit falhou"
+
+    sha = git("rev-parse", "--short", "HEAD").stdout.strip()
+    return sha, None
+
+
+# --------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(description="Vigia de config do MW3")
+    ap.add_argument("--dry", action="store_true", help="não grava nada, só mostra")
+    ap.add_argument("--forcar", action="store_true", help="regrava o baseline sem alertar")
+    ap.add_argument("--teste-discord", action="store_true", help="envia mensagem de teste")
+    ap.add_argument("--live", type=Path, default=CFG_PADRAO["live"])
+    ap.add_argument("--repo", type=Path, default=CFG_PADRAO["repo"])
+    ap.add_argument("--webhook", type=Path, default=CFG_PADRAO["webhook"])
+    ap.add_argument("--estado", type=Path, default=CFG_PADRAO["estado"])
+    args = ap.parse_args()
+
+    CFG.update(live=args.live, repo=args.repo, webhook=args.webhook, estado=args.estado)
+
+    if args.teste_discord:
+        enviar("**MW3** · `mw3-cfgwatch` teste de webhook · %s" % agora())
+        print("teste enviado")
+        return 0
+
+    vivos = arquivos_vivos()
+    if not vivos:
+        print("nenhum arquivo de config encontrado em %s" % CFG["live"], file=sys.stderr)
+        return 1
+
+    if not CFG["repo"].is_dir():
+        print("repo git não encontrado em %s" % CFG["repo"], file=sys.stderr)
+        return 1
+
+    CFG["estado"].mkdir(parents=True, exist_ok=True)
+
+    arquivo_seg = CFG["estado"] / "segredos.json"
+    primeira = not arquivo_seg.exists()
+    seg_antes = ler_json(arquivo_seg, {})
+    seg_novo = dict(seg_antes)
+    mudancas, blocos, primeiro = [], [], False
+
+    for rel, caminho in vivos:
+        conteudo = ler_texto(caminho)
+        novo = mascarar(conteudo)
+        marcas = impressao(conteudo)
+        snap = snap_path(rel)
+        sem_snapshot = not snap.exists()
+
+        # primeira execução (ou --forcar): só grava a base, sem alertar
+        if args.forcar or (sem_snapshot and primeira):
+            if not args.dry:
+                escrever(snap, novo)
+                seg_novo[rel] = marcas
+            if not args.forcar:
+                primeiro = True
+            continue
+
+        # arquivo novo depois da base: é mudança, avisa
+        if sem_snapshot:
+            seg_novo[rel] = marcas
+            blocos.append(
+                "**%s** · arquivo novo (%d linhas)\n```diff\n%s\n```"
+                % (rel, len(novo.splitlines()), diff_resumido(rel, "", novo, limite=12))
+            )
+            mudancas.append((rel, novo))
+            continue
+
+        antes = ler_texto(snap)
+        mudou_texto = antes != novo
+        mudou_segredo = seg_antes.get(rel, {}) != marcas
+        if not mudou_texto and not mudou_segredo:
+            continue
+
+        seg_novo[rel] = marcas
+        if mudou_texto:
+            add, rem = resumo_arquivo(antes, novo)
+            blocos.append(
+                "**%s** · +%d / -%d\n```diff\n%s\n```"
+                % (rel, add, rem, diff_resumido(rel, antes, novo))
+            )
+        if mudou_segredo:                            # senha/token trocado: avisa sem mostrar
+            velhas, novas = seg_antes.get(rel, {}), marcas
+            chaves = sorted(
+                k for k in set(velhas) | set(novas) if velhas.get(k) != novas.get(k)
+            )
+            blocos.append(
+                "**%s** · valor de `%s` alterado (mascarado; conteúdo real fora do git)"
+                % (rel, ", ".join(chaves))
+            )
+        mudancas.append((rel, novo))
+
+    atuais = {rel for rel, _ in vivos}
+    for rel in sorted(set(seg_antes) | set(atuais)):
+        if rel in atuais:
+            continue
+        blocos.append("**%s** · arquivo removido do servidor" % rel)
+        if not args.dry:
+            seg_novo.pop(rel, None)
+            try:
+                snap_path(rel).unlink()
+            except FileNotFoundError:
+                pass
+        mudancas.append((rel, None))
+
+    # primeira execução: cria baseline e commita, mas não alerta
+    if primeiro:
+        todos = [(rel, mascarar(ler_texto(c))) for rel, c in vivos]
+        seg_todos = {rel: impressao(ler_texto(c)) for rel, c in vivos}
+        if args.dry:
+            print("[dry] baseline: %d arquivo(s)" % len(todos))
+            return 0
+        sha, erro = versionar(todos, "cfg: baseline do vigia de configuração")
+        gravar_json(arquivo_seg, seg_todos)
+        print("baseline criado: %d arquivo(s)%s"
+              % (len(todos), "" if not sha else " · commit %s" % sha))
+        if erro:
+            print("aviso git: %s" % erro, file=sys.stderr)
+        return 0
+
+    if not mudancas:
+        if args.forcar and not args.dry:
+            gravar_json(arquivo_seg, seg_novo)
+        print("sem mudança desde a última verificação")
+        return 0
+
+    if args.dry:
+        print("[dry] %d arquivo(s) mudaram:\n" % len(mudancas))
+        print("\n".join(blocos))
+        return 0
+
+    for rel, novo in mudancas:                       # confirma o novo snapshot
+        if novo is not None:
+            escrever(snap_path(rel), novo)
+    gravar_json(arquivo_seg, seg_novo)
+
+    nomes = ", ".join(rel for rel, _ in mudancas)
+    sha, erro = versionar(mudancas, "cfg: mudança fora do git em %s" % nomes)
+
+    cabeca = "**MW3** · configuração alterada fora do git · `%s`" % agora()
+    rodape = "commit local `%s` · push manual pendente" % sha if sha else "commit não criado (%s)" % erro
+    enviar("\n".join([cabeca, ""] + blocos + ["", rodape]))
+
+    print("alerta enviado: %s%s" % (nomes, "" if not sha else " · commit %s" % sha))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:                          # cron nunca deve estourar calado
+        print("erro: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
+        sys.exit(1)

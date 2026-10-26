@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""mw3-alert - avisa no Discord quando o servidor MW3 gerar erro de script novo.
+
+Le so a janela de tempo desde a ultima execucao, entao e barato rodar de 15 em 15
+minutos mesmo com dias de log acumulado.
+
+    python3 mw3-alert.py                # janela desde a ultima execucao
+    python3 mw3-alert.py --dry          # mostra o que enviaria, sem enviar
+    python3 mw3-alert.py --janela 240   # primeira vez: olha as ultimas 4 horas
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import urllib.request
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+
+CONTAINER = "mw3server"
+ESTADO = "/var/lib/mw3-alert/estado.json"
+WEBHOOK = "/etc/mw3-alert/webhook"
+
+# Ruido conhecido: mapa portado (mp_favela) sem soundalias nos destrutíveis.
+IGNORAR = {
+    ("common_scripts/_destructible.gsc", "play_sound"),
+    ("maps/mp/_skill.gsc", "onplayerdisconnect"),
+}
+
+MAX_ORIGENS = 6
+
+# Horario de Brasilia nas mensagens. O estado e o --since continuam em UTC:
+# o docker entende o "Z" e nao depende do fuso do host.
+try:
+    from zoneinfo import ZoneInfo
+
+    FUSO = ZoneInfo("America/Sao_Paulo")
+except Exception:                       # sem tzdata no sistema
+    FUSO = timezone(timedelta(hours=-3))
+
+
+def local(iso):
+    """ISO em UTC (estado/docker) -> "dd/mm hh:mm (BRT)"."""
+    try:
+        dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return iso
+    return dt.astimezone(FUSO).strftime("%d/%m %H:%M")
+
+
+
+def docker(*args):
+    p = subprocess.run(["docker", *args], capture_output=True)
+    return (p.stdout or b"") + (p.stderr or b"")
+
+
+def erros_desde(inicio):
+    """Devolve [(arquivo, funcao)] dos erros de script na janela."""
+    bruto = docker("logs", "--since", inicio, CONTAINER).decode("utf-8", "replace")
+    bruto = re.sub(r"Plutonium r\d+ > ", "", bruto)
+    achados = []
+    for bloco in bruto.split("script runtime error")[1:]:
+        bloco = re.sub(r"\s+", " ", bloco)
+        m = re.search(r'at function "([^"]+)" in file "([^"]+)"', bloco)
+        if not m:
+            continue
+        func = m.group(1)
+        # o console quebra o caminho no meio ("sd." + "gsc"); depois de
+        # colapsar os espacos sobra "sd. gsc", entao tira todos.
+        arq = m.group(2).replace(" ", "")
+        if not arq.endswith(".gsc"):
+            continue
+        if (arq, func) in IGNORAR:
+            continue
+        achados.append((arq, func))
+    return achados
+
+
+def carregar():
+    try:
+        with open(ESTADO, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def salvar(dados):
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    with open(ESTADO, "w", encoding="utf-8") as f:
+        json.dump(dados, f)
+
+
+def enviar(texto):
+    try:
+        with open(WEBHOOK, encoding="utf-8") as f:
+            url = f.read().strip()
+    except FileNotFoundError:
+        print("[sem webhook em %s]\n%s" % (WEBHOOK, texto))
+        return
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"content": texto[:1900]}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "mw3-alert/1.0"},
+    )
+    urllib.request.urlopen(req, timeout=10).read()
+
+
+def agora_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry", action="store_true", help="mostra sem enviar")
+    ap.add_argument("--janela", type=int, default=15,
+                    help="minutos a olhar quando nao ha estado salvo")
+    args = ap.parse_args()
+
+    est = carregar()
+    agora = datetime.now(timezone.utc)
+    inicio = est.get("ultima") or (
+        agora - timedelta(minutes=args.janela)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    rodando = docker("inspect", "-f", "{{.State.Running}}", CONTAINER).decode().strip()
+
+    if rodando != "true":
+        if not est.get("parado"):
+            msg = "**MW3 parado**: o container `%s` nao esta rodando." % CONTAINER
+            print(msg) if args.dry else enviar(msg)
+            est["parado"] = True
+        if not args.dry: salvar(dict(est, ultima=agora_iso()))
+        return
+    est["parado"] = False
+
+    achados = erros_desde(inicio)
+    if achados:
+        contagem = Counter(achados)
+        linhas = ["**MW3**: %d erro(s) de script desde %s (BRT)" % (len(achados), local(inicio))]
+        for (arq, func), n in contagem.most_common(MAX_ORIGENS):
+            linhas.append("`%s` -> `%s` x%d" % (arq, func, n))
+        resto = len(contagem) - MAX_ORIGENS
+        if resto > 0:
+            linhas.append("... e mais %d origem(ns)" % resto)
+        texto = "\n".join(linhas)
+        if args.dry:
+            print(texto)
+        else:
+            try:
+                enviar(texto)
+            except Exception as e:
+                print("falha ao enviar: %s" % e)
+    elif args.dry:
+        print("nada novo desde %s (BRT)" % local(inicio))
+
+    if not args.dry: salvar(dict(est, ultima=agora_iso()))
+
+
+if __name__ == "__main__":
+    main()
