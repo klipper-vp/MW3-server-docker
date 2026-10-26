@@ -72,6 +72,13 @@ onplayerdisconnect()
     for (;;)
     {
         level waittill( "disconnected", var_0 );
+
+        // O notify chega depois que a entidade do jogador ja foi destruida em
+        // parte dos casos. Sem o guard, o acesso a .targets estoura em
+        // OP_EvalFieldVariableRef (que era o erro "em onplayerdisconnect").
+        if ( !IsDefined( var_0 ) )
+            continue;
+
         var_0.targets = [];
     }
 }
