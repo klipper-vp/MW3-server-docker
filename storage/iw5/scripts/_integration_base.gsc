@@ -542,8 +542,40 @@ AddClientCommand( commandName, shouldRunAsTarget, callback, shouldOverwrite )
 
 OnClientDataReceived( event )
 {
-    assertEx( isDefined( self ), "player entity is not defined");
+    // O IW4MAdmin pergunta e o jogador pode sair antes da resposta chegar.
+    // Sem estes guards o callback estourava em OP_EvalFieldVariableRef.
+    if ( !IsDefined( self ) )
+    {
+        LogDebug( "OnClientDataReceived: entidade do jogador nao existe mais" );
+        return;
+    }
+
+    if ( !IsDefined( self.pers ) )
+    {
+        LogDebug( "OnClientDataReceived: pers do jogador nao existe mais" );
+        return;
+    }
+
     clientData = self.pers[level.clientDataKey];
+
+    if ( !IsDefined( clientData ) )
+    {
+        LogDebug( "OnClientDataReceived: jogador sem clientData (bot ou saiu antes do connect)" );
+        return;
+    }
+
+    if ( !IsDefined( event ) )
+    {
+        LogDebug( "OnClientDataReceived: evento invalido" );
+        return;
+    }
+
+    if ( !IsDefined( event.data ) )
+    {
+        LogDebug( "OnClientDataReceived: evento sem data" );
+        clientData.state = level.eventBus.failKey;
+        return;
+    }
 
     if ( event.subtype == "Fail" ) 
     {
@@ -560,10 +592,25 @@ OnClientDataReceived( event )
         }
 
         metaKey = event.data[0];
+
+        if ( !IsDefined( metaKey ) )
+        {
+            LogDebug( "OnClientDataReceived: meta sem chave" );
+            return;
+        }
         clientData.meta[metaKey] = event.data[metaKey];
 
  	    LogDebug( "Meta Key=" + CoerceUndefined( metaKey ) + ", Meta Value=" + CoerceUndefined( event.data[metaKey] ) );
 
+        return;
+    }
+
+    clientId = event.data["clientId"];
+
+    if ( !IsDefined( clientId ) )
+    {
+        LogDebug( "OnClientDataReceived: resposta sem clientId (saiu no meio do pedido)" );
+        clientData.state = level.eventBus.failKey;
         return;
     }
 
