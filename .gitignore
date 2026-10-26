@@ -6,3 +6,6 @@ recipes/
 *.bak*
 console.log
 games_mp.log
+main/server.cfg
+.env
+IW4MAdminSettings.json
