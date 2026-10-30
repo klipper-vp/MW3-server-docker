@@ -334,7 +334,17 @@ createairship( var_0, var_1, var_2, var_3, var_4, var_5 )
     var_6.ospreytype = var_5;
     var_6.heli_type = level.ospreysettings[var_5].modelbase;
     var_6.helitype = level.ospreysettings[var_5].helitype;
-    var_6.attractor = missile_createattractorent( var_6, level.heli_attract_strength , level.heli_attract_range );
+    // Guards do servidor: e a linha do erro. heli_attract_strength e
+    // heli_attract_range sao preenchidos no init do _helicopter, que sai cedo
+    // em mapa sem heli_start; sem eles o builtin recebia undefined e matava a
+    // thread ("parameter 1 has type 'undefined', but should be a float").
+    if ( !isdefined( level.heli_attract_strength ) )
+        level.heli_attract_strength = 1000;
+
+    if ( !isdefined( level.heli_attract_range ) )
+        level.heli_attract_range = 4096;
+
+    var_6.attractor = missile_createattractorent( var_6, level.heli_attract_strength, level.heli_attract_range );
     var_6.lifeid = var_1;
     var_6.team = var_0.pers["team"];
 
