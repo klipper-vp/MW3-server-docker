@@ -84,6 +84,13 @@ Setup()
 
     LogDebug( "Integration received notify that game functions are initialized" );
 
+    // Guard do autobalance v1: game["strings"]["autobalance"] nao e setada nesta build e o balanceteams() do _teams.gsc abortava com undefined
+    if ( !isdefined( game["strings"] ) )
+        game["strings"] = [];
+
+    if ( !isdefined( game["strings"]["autobalance"] ) )
+        game["strings"]["autobalance"] = "^3AUTOBALANCE^7";
+
     _SetDvarIfUninitialized( level.eventBus.inVar, "" );
     _SetDvarIfUninitialized( level.eventBus.outVar, "" );
     _SetDvarIfUninitialized( level.commonKeys.enabled, 1 );
